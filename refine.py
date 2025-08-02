@@ -1,160 +1,118 @@
 """
-Script Purpose:
----------------
-This script processes a SQL dump file and replaces invalid empty string values (`''` or `""`)
-with `NULL` only for columns that:
-    1. Are not of type VARCHAR or TEXT
-    2. Explicitly allow NULL (i.e., have `DEFAULT NULL` in the schema)
+This script processes a filtered SQL file that contains only INSERT INTO statements
+and replaces any invalid empty strings ('' or "") with NULL — only for the column
+indexes provided in a JSON file (auto-generated from CREATE TABLE analysis).
 
-It reads the SQL file containing multiple `CREATE TABLE` and `INSERT INTO` statements, determines
-the correct columns where NULLs are valid, and rewrites the insert value rows accordingly.
-
-Usage:
-------
-- Update the `input_file` and `output_file` paths as needed.
-- Run the script to fix the file in-place or write a corrected version.
-
-Limitations:
-------------
-- This works on SQL dumps where inserts are line-by-line (each value row in its own line).
-- It assumes MySQL-compatible syntax.
+Handles:
+- INSERT INTO statements that span multiple lines.
+- Value rows that may include newlines within string columns.
 """
 
-import re  # Regular expressions for parsing SQL lines
+import os
+import json
+import re
 
-input_file = 'chunks/building_database_5.sql'  # Input SQL file path
-output_file = input_file  # Output file (overwrite input or set to new file)
+# --- Configuration ---
+input_file = 'chunks/building_database_temp.sql'  # Modify per file
+output_file = 'chunks/building_database_temp_refined.sql'  # Overwrite in-place
+json_index_file = 'chunks/building_database_indexes.json'
 
-
-def get_nullable_non_text_column_indexes(create_sql: str) -> list[int]:
-    """
-    Extract column indexes where DEFAULT NULL is allowed and type is NOT VARCHAR or TEXT.
-    These are the indexes eligible for replacing '' or "" with NULL in insert statements.
-    """
-    lines = create_sql.splitlines()  # Split the CREATE TABLE SQL into lines
-    column_defs = []  # Store lines defining each column
-    collecting = False  # Flag to know if we're inside a CREATE TABLE block
-
-    for line in lines:
-        line = line.strip()
-        if line.lower().startswith("create table"):
-            collecting = True
-        elif collecting and line.startswith("`"):  # Column definition
-            column_defs.append(line)
-        elif collecting and line.startswith(")") and "engine=" in line.lower():  # End of CREATE
-            break
-
-    indexes = []  # Column indexes where NULL is allowed and not a text type
-
-    for idx, col in enumerate(column_defs):
-        parts = re.split(r'\s+', col, maxsplit=3)  # Split into parts: name, type, rest
-        if len(parts) < 3:
-            continue
-
-        col_type = parts[1].lower()  # Get data type (e.g., INT, DATE)
-        col_def = ' '.join(parts[2:]).lower()  # Rest of column definition
-
-        if any(t in col_type for t in ['varchar', 'text']):
-            continue  # Skip string/text types
-
-        if 'default null' in col_def:
-            indexes.append(idx)  # Keep track of index if it's nullable and not string
-
-    return indexes
+# --- Load nullable non-text indexes per table ---
+with open(json_index_file, 'r', encoding='utf-8') as f:
+    nullable_index_map = json.load(f)
 
 
 def fix_row(row_line: str, null_column_indexes: list[int]) -> str:
     """
-    Given a single INSERT value row, replace '' or "" with NULL for specified column indexes.
+    Replace '' or "" with NULL in a value row at specified column positions.
+    Works even if the row ends with ');' instead of '),'.
     """
     row = row_line.strip()
-
-    if not row.startswith('('):  # Not a value line
+    if not row.startswith('('):
         return row_line
 
-    ends_with_comma = row.endswith(',')  # Check if row ends with comma (more to come)
-    if ends_with_comma:
-        row = row[:-1]  # Remove trailing comma
+    ends_with_comma = row.endswith(',')  # whether the row ends with ","
+    ends_with_semicolon = row.endswith(');')
 
-    # Split row into individual values, taking care of quoted strings
+    if ends_with_comma:
+        row = row[:-1]
+    elif ends_with_semicolon:
+        row = row[:-2]
+
+    # Now row is (val1, val2, ..., valN)
+    row = row.strip()
+    if row.startswith('('):
+        row = row[1:]
+    if row.endswith(')'):
+        row = row[:-1]
+
     parts = []
     current = ''
     in_quotes = False
+    escape = False
     quote_char = ''
 
-    for char in row[1:-1]:  # Remove parentheses before parsing
-        if char in ['"', "'"]:
+    # Properly parse values, respecting quotes and escaped characters
+    for char in row:
+        if escape:
+            current += char
+            escape = False
+        elif char == '\\':
+            current += char
+            escape = True
+        elif char in ["'", '"']:
+            current += char
             if not in_quotes:
                 in_quotes = True
                 quote_char = char
-            elif in_quotes and char == quote_char:
+            elif char == quote_char:
                 in_quotes = False
-
-        if char == ',' and not in_quotes:
+        elif char == ',' and not in_quotes:
             parts.append(current.strip())
             current = ''
         else:
             current += char
-    parts.append(current.strip())  # Add the last field
+    parts.append(current.strip())  # Add last part
 
-    # Replace empty strings with NULL for target indexes
+    # Replace empty strings with NULL
     for i in null_column_indexes:
         if i < len(parts) and parts[i] in ["''", '""']:
             parts[i] = 'NULL'
 
-    # Reconstruct the row with fixed values
-    if ends_with_comma:
-        fixed_row = '(' + ', '.join(parts) + '),'
-    else:
-        fixed_row = '(' + ', '.join(parts) + ';'
-
-    return fixed_row + '\n'  # Add newline
+    # Reassemble
+    fixed_row = '(' + ', '.join(parts)
+    fixed_row += '),' if ends_with_comma else ');'
+    return fixed_row + '\n'
 
 
-# Begin processing file
-with open(input_file, 'r', encoding='utf-8') as infile:
-    lines = infile.readlines()  # Read all lines from file
+# --- Main Processing ---
+with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
+    current_table = None
+    current_indexes = []
 
-with open(output_file, 'w', encoding='utf-8') as outfile:
-    current_create_sql = ""  # Will store CREATE TABLE SQL temporarily
-    current_null_indexes = []  # Indexes where '' should be replaced with NULL
-    processing_create = False  # Are we inside CREATE TABLE?
-    processing_insert = False  # Are we inside INSERT INTO?
+    accumulating_row = False
+    row_buffer = []
 
-    for line in lines:
+    for line in infile:
         stripped = line.strip().lower()
 
-        # Start of a CREATE TABLE block
-        if stripped.startswith("create table"):
-            processing_create = True
-            current_create_sql = line
+        if stripped.startswith('insert into'):
+            match = re.match(r'insert into [`"]?(\w+)[`"]?\s+values', stripped)
+            if match:
+                current_table = match.group(1)
+                current_indexes = nullable_index_map.get(current_table, [])
             outfile.write(line)
-            continue
+        elif line.strip().startswith('(') or accumulating_row:
+            row_buffer.append(line)
+            accumulating_row = True
 
-        if processing_create:
-            current_create_sql += line
-            outfile.write(line)
-            if stripped.endswith(");"):
-                # End of CREATE TABLE block — extract nullable indexes
-                current_null_indexes = get_nullable_non_text_column_indexes(current_create_sql)
-                processing_create = False
-            continue
-
-        # Start of an INSERT INTO block
-        if stripped.startswith("insert into"):
-            processing_insert = True
-            outfile.write(line)
-            continue
-
-        if processing_insert:
-            if line.strip().startswith('('):
-                # Fix and write insert value row
-                fixed = fix_row(line, current_null_indexes)
+            if line.strip().endswith('),') or line.strip().endswith(');'):
+                full_row = ''.join(row_buffer)
+                fixed = fix_row(full_row, current_indexes)
                 outfile.write(fixed)
-                continue
-            else:
-                # INSERT block ends if the line doesn't start with '('
-                processing_insert = False
+                row_buffer = []
+                accumulating_row = False
+        else:
+            outfile.write(line)
 
-        # Write any non-handled line directly
-        outfile.write(line)
+print(f"✅ Cleaned {input_file} using {json_index_file}")
